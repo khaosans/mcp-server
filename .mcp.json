@@ -1,0 +1,18 @@
+{
+    "tool_declarations": {
+        "morpho_get_position": {
+            "description": "Gets the lending/borrowing position for a wallet in a specific Morpho Blue pool on Base chain.",
+            "parameters": {
+                "wallet_address": {
+                    "type": "string",
+                    "description": "The EVM wallet address to check position for"
+                },
+                "pool_id": {
+                    "type": "string",
+                    "description": "Pool identifier (e.g. 'cbETH/USDC', 'wstETH/USDC', 'USDbC/USDC')",
+                    "optional": true
+                }
+            }
+        }
+    }
+} 
