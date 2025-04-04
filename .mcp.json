@@ -1,18 +1,52 @@
 {
-    "tool_declarations": {
-        "morpho_get_position": {
-            "description": "Gets the lending/borrowing position for a wallet in a specific Morpho Blue pool on Base chain.",
+    "name": "MCP Server",
+    "version": "0.1.0",
+    "description": "MCP Server Package for Morpho Blue Integration",
+    "server": {
+        "url": "http://localhost:8080",
+        "endpoints": {
+            "health": "/",
+            "tools": "/tools",
+            "files": "/files",
+            "websocket": "/ws"
+        }
+    },
+    "tools": [
+        {
+            "id": "summarize",
+            "name": "Text Summarizer",
+            "description": "Summarizes the given text",
+            "parameters": {
+                "text": {
+                    "type": "string",
+                    "description": "Text to summarize"
+                }
+            }
+        },
+        {
+            "id": "morpho_get_position",
+            "name": "Morpho Position Checker",
+            "description": "Gets the position of a wallet in a specific Morpho pool",
             "parameters": {
                 "wallet": {
                     "type": "string",
-                    "description": "The EVM wallet address to check position for"
+                    "description": "Ethereum wallet address"
                 },
                 "pool_id": {
                     "type": "string",
-                    "description": "Pool identifier (e.g. 'cbETH/USDC', 'wstETH/USDC', 'USDbC/USDC')",
-                    "optional": true
+                    "description": "Pool identifier (e.g., 'cbETH/USDC')",
+                    "enum": ["cbBTC/USDC", "cbETH/USDC", "wstETH/USDC", "USDbC/USDC"]
                 }
             }
+        }
+    ],
+    "development": {
+        "environment": "local",
+        "logLevel": "debug",
+        "hotReload": true,
+        "staticFiles": {
+            "directory": "public",
+            "mountPath": "/public"
         }
     }
 }

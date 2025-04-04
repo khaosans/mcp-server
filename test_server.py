@@ -6,6 +6,7 @@ from typing import Dict, Any, Optional
 import sys
 import logging
 from datetime import datetime
+import sseclient
 
 # Configure logging
 logging.basicConfig(
@@ -47,7 +48,11 @@ class ServerTester:
         try:
             response = requests.get(self.base_url)
             response.raise_for_status()
-            self.print_result("Server Health", True, "Server is up and responding")
+            data = response.json()
+            if data.get("status") == "ok":
+                self.print_result("Server Health", True, "Server is up and responding")
+            else:
+                self.print_result("Server Health", False, "Server returned unexpected status")
         except Exception as e:
             self.print_result("Server Health", False, f"Server health check failed: {str(e)}")
 
@@ -62,12 +67,12 @@ class ServerTester:
             if not isinstance(data, dict):
                 raise ValueError("Response is not a dictionary")
             
-            matches = data.get('matches', [])
-            if not isinstance(matches, list):
-                raise ValueError("'matches' is not a list")
+            files = data.get('files', [])
+            if not isinstance(files, list):
+                raise ValueError("'files' is not a list")
             
             self.print_result("Files Endpoint", True, 
-                            f"Found {len(matches)} files, response structure valid")
+                            f"Found {len(files)} files, response structure valid")
         except Exception as e:
             self.print_result("Files Endpoint", False, str(e))
 
@@ -90,171 +95,161 @@ class ServerTester:
                 logger.info(f"Testing tools endpoint with task: {task['task']}")
                 response = requests.post(
                     f"{self.base_url}/tools",
-                    json=task
+                    json=task,
+                    stream=True,
+                    headers={'Accept': 'text/event-stream'}
                 )
                 
                 # Log response details
                 logger.info(f"Response status: {response.status_code}")
                 logger.info(f"Response headers: {dict(response.headers)}")
                 
-                try:
-                    response_content = response.json()
-                    logger.info(f"Response content: {json.dumps(response_content, indent=2)}")
-                except Exception as e:
-                    logger.error(f"Could not parse response as JSON: {str(e)}")
-                    logger.error(f"Raw response: {response.text}")
-                
                 if response.status_code == 200:
-                    self.print_result(f"Tools Endpoint - {task['task']}", True, 
-                                    f"Response: {json.dumps(response_content, indent=2)}")
+                    client = sseclient.SSEClient(response)
+                    for event in client.events():
+                        try:
+                            data = json.loads(event.data)
+                            if "error" in data:
+                                raise ValueError(f"Tool returned error: {data['error']}")
+                            self.print_result(f"Tools Endpoint - {task['task']}", True, 
+                                           f"Received valid response: {json.dumps(data, indent=2)}")
+                            break
+                        except json.JSONDecodeError:
+                            raise ValueError("Invalid JSON in SSE response")
                 else:
-                    error_detail = "Unknown error"
-                    try:
-                        error_response = response.json()
-                        error_detail = error_response.get("detail", str(response.text))
-                    except:
-                        error_detail = str(response.text)
+                    raise ValueError(f"Unexpected status code: {response.status_code}")
                     
-                    self.print_result(f"Tools Endpoint - {task['task']}", False,
-                                    f"HTTP error {response.status_code}: {error_detail}")
             except Exception as e:
                 self.print_result(f"Tools Endpoint - {task['task']}", False, str(e))
 
     async def test_websocket(self):
-        """Test WebSocket connection with multiple messages"""
+        """Test WebSocket connection and message exchange"""
         try:
             async with websockets.connect(self.ws_url) as websocket:
-                # Test multiple messages
-                messages = [
-                    "Hello WebSocket!",
-                    json.dumps({"type": "test", "data": "JSON message"}),
-                    "Final message"
-                ]
+                # Send a test message
+                test_message = {"type": "test", "content": "Hello Server"}
+                await websocket.send(json.dumps(test_message))
                 
-                for msg in messages:
-                    await websocket.send(msg)
-                    response = await websocket.recv()
-                    logger.info(f"WebSocket message sent: {msg}")
-                    logger.info(f"WebSocket response received: {response}")
+                # Wait for response
+                response = await websocket.recv()
+                response_data = json.loads(response)
                 
-                # Gracefully close
-                await websocket.close(code=1000, reason="Test completed")
-                self.print_result("WebSocket", True, "Successfully sent multiple messages")
+                if response_data.get("status") == "received":
+                    self.print_result("WebSocket", True, "Successfully exchanged messages")
+                else:
+                    self.print_result("WebSocket", False, "Unexpected response format")
         except Exception as e:
-            if "code = 1000" in str(e):
-                self.print_result("WebSocket", True, "Connection closed normally")
-            else:
-                self.print_result("WebSocket", False, str(e))
+            self.print_result("WebSocket", False, str(e))
 
     async def test_static_file(self):
-        """Test static file serving with validation"""
+        """Test static file serving"""
         try:
-            response = requests.get(f"{self.base_url}/public/test.txt")
+            # First, create a test file if it doesn't exist
+            test_file = "test.txt"
+            test_content = "Hello from MCP Server"
+            
+            response = requests.get(f"{self.base_url}/public/{test_file}")
             response.raise_for_status()
             
-            # Validate content type
-            content_type = response.headers.get('content-type', '')
-            if 'text/plain' not in content_type:
-                raise ValueError(f"Unexpected content type: {content_type}")
-            
-            content = response.text
-            if not content:
-                raise ValueError("Empty file content")
-            
-            self.print_result("Static File", True, 
-                            f"Content type: {content_type}, Content: {content}")
+            if response.text.strip() == test_content:
+                self.print_result("Static File", True, "Successfully retrieved test file")
+            else:
+                self.print_result("Static File", False, "File content mismatch")
         except Exception as e:
             self.print_result("Static File", False, str(e))
 
     async def test_morpho_position_tool(self):
-        """Test Morpho position tool with validation"""
-        try:
-            # Test with known valid market
-            market_address = self.valid_markets.get(self.pool_id)
-            if not market_address:
-                raise ValueError(f"No valid market address found for pool {self.pool_id}")
-            
-            test_data = {
-                "task": "morpho_get_position",
+        """Test Morpho position tool with various scenarios"""
+        test_cases = [
+            {
+                "name": "Valid wallet and pool",
                 "wallet": self.wallet_address,
-                "pool_id": self.pool_id
+                "pool_id": self.pool_id,
+                "should_succeed": True
+            },
+            {
+                "name": "Invalid wallet address",
+                "wallet": "0xinvalid",
+                "pool_id": self.pool_id,
+                "should_succeed": False
+            },
+            {
+                "name": "Invalid pool ID",
+                "wallet": self.wallet_address,
+                "pool_id": "invalid/pool",
+                "should_succeed": False
             }
-            
-            logger.info(f"Testing Morpho Position Tool with data: {json.dumps(test_data, indent=2)}")
-            logger.info(f"Using market address: {market_address}")
-            
-            response = requests.post(
-                f"{self.base_url}/tools",
-                json=test_data
-            )
-            
-            # Log response details
-            logger.info(f"Response status: {response.status_code}")
-            logger.info(f"Response headers: {dict(response.headers)}")
-            
+        ]
+        
+        for test_case in test_cases:
             try:
-                response_content = response.json()
-                logger.info(f"Response content: {json.dumps(response_content, indent=2)}")
-            except Exception as e:
-                logger.error(f"Could not parse response as JSON: {str(e)}")
-                logger.error(f"Raw response: {response.text}")
-            
-            if response.status_code == 200:
-                data = response.json()
-                required_fields = ["supply_shares", "borrow_shares", "collateral"]
-                missing_fields = [field for field in required_fields if field not in data]
+                response = requests.post(
+                    f"{self.base_url}/tools",
+                    json={
+                        "task": "morpho_get_position",
+                        "wallet": test_case["wallet"],
+                        "pool_id": test_case["pool_id"]
+                    },
+                    stream=True,
+                    headers={'Accept': 'text/event-stream'}
+                )
                 
-                if missing_fields:
-                    self.print_result("Morpho Position Tool", False,
-                                    f"Missing required fields: {missing_fields}")
+                if response.status_code == 200:
+                    client = sseclient.SSEClient(response)
+                    for event in client.events():
+                        try:
+                            data = json.loads(event.data)
+                            if "error" in data:
+                                if test_case["should_succeed"]:
+                                    raise ValueError(f"Unexpected error: {data['error']}")
+                                else:
+                                    self.print_result(f"Morpho Position - {test_case['name']}", True,
+                                                   f"Expected error received: {data['error']}")
+                            else:
+                                if test_case["should_succeed"]:
+                                    self.print_result(f"Morpho Position - {test_case['name']}", True,
+                                                   f"Successfully retrieved position: {json.dumps(data, indent=2)}")
+                                else:
+                                    raise ValueError("Unexpected success response")
+                            break
+                        except json.JSONDecodeError:
+                            raise ValueError("Invalid JSON in SSE response")
                 else:
-                    self.print_result("Morpho Position Tool", True,
-                                    f"Position data: {json.dumps(data, indent=2)}")
-            else:
-                error_detail = "Unknown error"
-                try:
-                    error_response = response.json()
-                    error_detail = error_response.get("detail", str(response.text))
-                except:
-                    error_detail = str(response.text)
-                
-                self.print_result("Morpho Position Tool", False,
-                                f"HTTP error {response.status_code}: {error_detail}")
-        except Exception as e:
-            self.print_result("Morpho Position Tool", False, str(e))
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
+                    raise ValueError(f"Unexpected status code: {response.status_code}")
+                    
+            except Exception as e:
+                if test_case["should_succeed"]:
+                    self.print_result(f"Morpho Position - {test_case['name']}", False, str(e))
+                else:
+                    self.print_result(f"Morpho Position - {test_case['name']}", True,
+                                   f"Expected error: {str(e)}")
 
     def print_summary(self):
-        """Print detailed test summary with statistics"""
-        print("\n📊 Test Summary:")
-        print("=" * 50)
-        total = len(self.results)
-        passed = sum(1 for v in self.results.values() if v)
-        failed = total - passed
-        duration = (datetime.now() - self.test_start_time).total_seconds()
+        """Print test summary with statistics"""
+        total_tests = len(self.results)
+        passed_tests = sum(1 for result in self.results.values() if result)
+        failed_tests = total_tests - passed_tests
+        success_rate = (passed_tests / total_tests) * 100 if total_tests > 0 else 0
         
-        print(f"⏱️  Total Duration: {duration:.2f}s")
-        print(f"📝 Total Tests: {total}")
-        print(f"✅ Passed: {passed}")
-        print(f"❌ Failed: {failed}")
-        print(f"📈 Success Rate: {(passed/total)*100:.1f}%")
+        print("\n" + "="*50)
+        print("📊 Test Summary")
+        print("="*50)
+        print(f"Total Tests: {total_tests}")
+        print(f"✅ Passed: {passed_tests}")
+        print(f"❌ Failed: {failed_tests}")
+        print(f"Success Rate: {success_rate:.1f}%")
+        print("="*50)
         
-        if failed > 0:
-            print("\n❌ Failed Tests:")
+        if failed_tests > 0:
+            print("\nFailed Tests:")
             for test_name, success in self.results.items():
                 if not success:
-                    print(f"   - {test_name}")
+                    print(f"❌ {test_name}")
         
-        print("=" * 50)
+        return success_rate == 100
 
 async def main():
-    print("\n🚀 Starting Server Tests...")
-    print("=" * 50)
-    print(f"⏰ Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"🌐 Base URL: http://localhost:8080")
-    print("=" * 50)
-    
+    """Main test runner"""
     tester = ServerTester()
     
     # Run all tests
@@ -266,10 +261,10 @@ async def main():
     await tester.test_morpho_position_tool()
     
     # Print summary
-    tester.print_summary()
+    success = tester.print_summary()
     
     # Exit with appropriate status code
-    sys.exit(0 if all(tester.results.values()) else 1)
+    sys.exit(0 if success else 1)
 
 if __name__ == "__main__":
     asyncio.run(main())

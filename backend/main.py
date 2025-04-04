@@ -1,12 +1,17 @@
-from fastapi import FastAPI, WebSocket, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, WebSocket, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from web3 import Web3
+from fastapi.responses import JSONResponse, StreamingResponse
 import logging
+import os
+from web3 import Web3
+from dotenv import load_dotenv
+import requests
 import json
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import asyncio
-from morpho_constants import (
+from pathlib import Path
+from .morpho_constants import (
     BASE_RPC_URL,
     MORPHO_LENS_ADDRESS,
     MORPHO_FACTORY_ADDRESS,
@@ -22,6 +27,15 @@ logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI()
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Initialize Web3 and contracts
 try:
@@ -47,46 +61,98 @@ except Exception as e:
     logger.error(f"Failed to initialize Web3: {e}")
     raise
 
+# Get the absolute path to the public directory
+PUBLIC_DIR = Path(__file__).parent.parent / "public"
+if not PUBLIC_DIR.exists():
+    PUBLIC_DIR.mkdir(parents=True)
+
 # Mount static files
-app.mount("/public", StaticFiles(directory="../public"), name="public")
+app.mount("/public", StaticFiles(directory=str(PUBLIC_DIR)), name="public")
 
 @app.get("/")
 async def root():
     """Health check endpoint"""
-    return JSONResponse({"status": "ok", "message": "Server is running"})
+    return {"status": "ok", "message": "Server is running"}
 
 @app.get("/files")
-async def get_files():
-    """Get list of available files"""
-    try:
-        # For now, return a static list
-        files = ["test.txt"]
-        return JSONResponse({"files": files})
-    except Exception as e:
-        logger.error(f"Error getting files: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+async def list_files():
+    """List available files in the public directory"""
+    files = []
+    for file in PUBLIC_DIR.glob("**/*"):
+        if file.is_file():
+            files.append(str(file.relative_to(PUBLIC_DIR)))
+    return {"files": files}
 
-@app.post("/tools")
-async def run_tool(request: Dict[str, Any]):
-    """Run a specific tool based on the request"""
+@app.get("/tools")
+async def list_tools():
+    """List available tools and their descriptions"""
+    return {
+        "tools": [
+            {
+                "id": "summarize",
+                "name": "Text Summarizer",
+                "description": "Summarizes the given text",
+                "parameters": {
+                    "text": {
+                        "type": "string",
+                        "description": "Text to summarize"
+                    }
+                }
+            },
+            {
+                "id": "morpho_get_position",
+                "name": "Morpho Position Checker",
+                "description": "Gets the position of a wallet in a specific Morpho pool",
+                "parameters": {
+                    "wallet": {
+                        "type": "string",
+                        "description": "Ethereum wallet address"
+                    },
+                    "pool_id": {
+                        "type": "string",
+                        "description": "Pool identifier (e.g., 'cbETH/USDC')",
+                        "enum": ["cbBTC/USDC", "cbETH/USDC", "wstETH/USDC", "USDbC/USDC"]
+                    }
+                }
+            }
+        ]
+    }
+
+async def stream_tool_response(request: Dict[str, Any]):
+    """Stream tool responses as SSE events"""
     try:
         task = request.get("task")
         if not task:
-            raise HTTPException(status_code=400, detail="No task specified")
+            yield "data: " + json.dumps({"error": "No task specified"}) + "\n\n"
+            return
 
         if task == "summarize":
             text = request.get("text", "")
-            return await summarize_text(text)
+            yield "data: " + json.dumps(await summarize_text(text)) + "\n\n"
         elif task == "morpho_get_position":
             wallet = request.get("wallet")
             pool_id = request.get("pool_id")
             if not wallet or not pool_id:
-                raise HTTPException(status_code=400, detail="Missing wallet or pool_id")
-            return await get_morpho_position(wallet, pool_id)
+                yield "data: " + json.dumps({"error": "Missing wallet or pool_id"}) + "\n\n"
+                return
+            yield "data: " + json.dumps(await get_morpho_position(wallet, pool_id)) + "\n\n"
         else:
-            raise HTTPException(status_code=400, detail=f"Unknown task: {task}")
+            yield "data: " + json.dumps({"error": f"Unknown task: {task}"}) + "\n\n"
     except Exception as e:
         logger.error(f"Error running tool: {e}")
+        yield "data: " + json.dumps({"error": str(e)}) + "\n\n"
+
+@app.post("/tools")
+async def run_tool(request: Request):
+    """Run a specific tool based on the request"""
+    try:
+        body = await request.json()
+        return StreamingResponse(
+            stream_tool_response(body),
+            media_type="text/event-stream"
+        )
+    except Exception as e:
+        logger.error(f"Error processing request: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.websocket("/ws")
